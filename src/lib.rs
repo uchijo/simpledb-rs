@@ -1,4 +1,4 @@
-//! SimpleDB chapters 3–6: files, logs, buffers, transactions, and records.
+//! SimpleDB chapters 3–7: storage, transactions, records, and metadata.
 //!
 //! Use one file manager, log manager, and buffer manager per database. Pins are
 //! released on drop; dirty pages are written on replacement or `flush_all`.
@@ -45,6 +45,8 @@
 pub mod buffer;
 pub mod file;
 pub mod log;
+pub mod metadata;
 pub mod record;
+pub mod server;
 mod sync;
 pub mod tx;

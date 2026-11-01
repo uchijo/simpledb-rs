@@ -24,12 +24,7 @@ impl LogManager {
     pub fn new(file_manager: Arc<Mutex<FileManager>>, filename: &str) -> io::Result<Self> {
         let mut file_manager_guard = lock(&file_manager)?;
         let block_size = file_manager_guard.block_size();
-        if !(MIN_BLOCK_SIZE..=i32::MAX as usize).contains(&block_size) {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "invalid log block size",
-            ));
-        }
+        Self::check_block_size(block_size)?;
         let block_count = file_manager_guard.length(filename)?;
         let (block, page) = if block_count == 0 {
             append_new_block(&mut file_manager_guard, filename)?
@@ -99,6 +94,16 @@ impl LogManager {
             self.block.clone(),
             self.page.clone(),
         )
+    }
+
+    pub(crate) fn check_block_size(block_size: usize) -> io::Result<()> {
+        if !(MIN_BLOCK_SIZE..=i32::MAX as usize).contains(&block_size) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid log block size",
+            ));
+        }
+        Ok(())
     }
 }
 
