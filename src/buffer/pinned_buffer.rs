@@ -10,7 +10,7 @@ use super::{Buffer, BufferManager};
 /// Owns a manager reference so transactions can store their pins without self-borrows.
 pub struct PinnedBuffer {
     pub(super) manager: Arc<BufferManager>,
-    pub(super) index: usize,
+    pub(super) buffer_index: usize,
 }
 
 impl PinnedBuffer {
@@ -19,20 +19,21 @@ impl PinnedBuffer {
     pub fn lock(&self) -> io::Result<BufferGuard<'_>> {
         Ok(BufferGuard {
             pool: lock(&self.manager.pool)?,
-            index: self.index,
+            buffer_index: self.buffer_index,
         })
     }
 }
 
 impl Drop for PinnedBuffer {
     fn drop(&mut self) {
+        // Only release the pin; normal access still rejects the poisoned pool.
         let mut pool = self
             .manager
             .pool
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        pool[self.index].pins -= 1;
-        if !pool[self.index].is_pinned() {
+        pool[self.buffer_index].pin_count -= 1;
+        if !pool[self.buffer_index].is_pinned() {
             self.manager.released.notify_all();
         }
     }
@@ -41,19 +42,19 @@ impl Drop for PinnedBuffer {
 /// Locked access to a pinned buffer. Unlocks on drop without releasing the pin.
 pub struct BufferGuard<'a> {
     pool: MutexGuard<'a, Vec<Buffer>>,
-    index: usize,
+    buffer_index: usize,
 }
 
 impl Deref for BufferGuard<'_> {
     type Target = Buffer;
 
     fn deref(&self) -> &Buffer {
-        &self.pool[self.index]
+        &self.pool[self.buffer_index]
     }
 }
 
 impl DerefMut for BufferGuard<'_> {
     fn deref_mut(&mut self) -> &mut Buffer {
-        &mut self.pool[self.index]
+        &mut self.pool[self.buffer_index]
     }
 }

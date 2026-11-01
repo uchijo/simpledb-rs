@@ -8,9 +8,9 @@ use crate::sync::lock;
 pub struct Buffer {
     contents: Page,
     block: Option<BlockId>,
-    pub(super) pins: usize,
-    transaction: Option<u64>,
-    lsn: Option<u64>,
+    pub(super) pin_count: usize,
+    modifying_transaction_id: Option<u64>,
+    last_update_lsn: Option<u64>,
 }
 
 impl Buffer {
@@ -18,33 +18,40 @@ impl Buffer {
         Self {
             contents: Page::new(block_size),
             block: None,
-            pins: 0,
-            transaction: None,
-            lsn: None,
+            pin_count: 0,
+            modifying_transaction_id: None,
+            last_update_lsn: None,
         }
     }
 
     pub fn contents(&self) -> &Page {
         &self.contents
     }
+
     pub fn contents_mut(&mut self) -> &mut Page {
         &mut self.contents
     }
+
     pub fn block(&self) -> Option<&BlockId> {
         self.block.as_ref()
     }
+
     pub fn is_pinned(&self) -> bool {
-        self.pins > 0
+        self.pin_count > 0
     }
+
     pub fn modifying_tx(&self) -> Option<u64> {
-        self.transaction
+        self.modifying_transaction_id
     }
 
     /// Call after changing the page. `None` means this update has no log record.
-    pub fn set_modified(&mut self, transaction: u64, lsn: Option<u64>) {
-        self.transaction = Some(transaction);
+    pub fn set_modified(&mut self, transaction_id: u64, lsn: Option<u64>) {
+        self.modifying_transaction_id = Some(transaction_id);
         if let Some(lsn) = lsn {
-            self.lsn = Some(self.lsn.map_or(lsn, |previous| previous.max(lsn)));
+            self.last_update_lsn = Some(
+                self.last_update_lsn
+                    .map_or(lsn, |previous| previous.max(lsn)),
+            );
         }
     }
 
@@ -67,18 +74,21 @@ impl Buffer {
         file_manager: &Mutex<FileManager>,
         log_manager: &Mutex<LogManager>,
     ) -> io::Result<()> {
-        if self.transaction.is_some() {
-            // Write-ahead logging: the log must reach disk before the data page.
-            if let Some(lsn) = self.lsn {
-                lock(log_manager)?.flush(lsn)?;
-            }
-            lock(file_manager)?.write(
-                self.block.as_ref().expect("dirty buffer has a block"),
-                &self.contents,
-            )?;
-            self.transaction = None;
-            self.lsn = None;
+        if self.modifying_transaction_id.is_none() {
+            return Ok(());
         }
+
+        // Write-ahead logging: the log must reach disk before the data page.
+        if let Some(lsn) = self.last_update_lsn {
+            lock(log_manager)?.flush(lsn)?;
+        }
+        lock(file_manager)?.write(
+            self.block.as_ref().expect("dirty buffer has a block"),
+            &self.contents,
+        )?;
+
+        self.modifying_transaction_id = None;
+        self.last_update_lsn = None;
         Ok(())
     }
 }

@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use crate::file::{BlockId, FileManager, Page};
 use crate::sync::lock;
 
-use super::log_iterator::{BOUNDARY_BYTES, LogIterator, RECORD_LENGTH_BYTES, boundary};
+use super::log_iterator::{
+    BOUNDARY_BYTES, BOUNDARY_OFFSET, LogIterator, RECORD_LENGTH_BYTES, read_boundary,
+};
 
 const MIN_BLOCK_SIZE: usize = BOUNDARY_BYTES + RECORD_LENGTH_BYTES;
 
@@ -20,25 +22,25 @@ pub struct LogManager {
 
 impl LogManager {
     pub fn new(file_manager: Arc<Mutex<FileManager>>, filename: &str) -> io::Result<Self> {
-        let mut files = lock(&file_manager)?;
-        let size = files.block_size();
-        if !(MIN_BLOCK_SIZE..=i32::MAX as usize).contains(&size) {
+        let mut file_manager_guard = lock(&file_manager)?;
+        let block_size = file_manager_guard.block_size();
+        if !(MIN_BLOCK_SIZE..=i32::MAX as usize).contains(&block_size) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "invalid log block size",
             ));
         }
-        let length = files.length(filename)?;
-        let (block, page) = if length == 0 {
-            append_new_block(&mut files, filename)?
+        let block_count = file_manager_guard.length(filename)?;
+        let (block, page) = if block_count == 0 {
+            append_new_block(&mut file_manager_guard, filename)?
         } else {
-            let block = BlockId::new(filename, length - 1);
-            let mut page = Page::new(size);
-            files.read(&block, &mut page)?;
-            boundary(&page)?;
+            let block = BlockId::new(filename, block_count - 1);
+            let mut page = Page::new(block_size);
+            file_manager_guard.read(&block, &mut page)?;
+            read_boundary(&page)?;
             (block, page)
         };
-        drop(files);
+        drop(file_manager_guard);
         Ok(Self {
             file_manager,
             page,
@@ -49,8 +51,8 @@ impl LogManager {
     }
 
     pub fn append(&mut self, record: &[u8]) -> io::Result<u64> {
-        let size = self.page.contents().len();
-        if record.len() > size - MIN_BLOCK_SIZE {
+        let block_size = self.page.contents().len();
+        if record.len() > block_size - MIN_BLOCK_SIZE {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "log record exceeds block capacity",
@@ -60,17 +62,19 @@ impl LogManager {
             .latest_lsn
             .checked_add(1)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "LSN overflow"))?;
-        let needed = RECORD_LENGTH_BYTES + record.len();
-        let mut position = boundary(&self.page)?;
-        if needed > position - BOUNDARY_BYTES {
+        let record_storage_size = RECORD_LENGTH_BYTES + record.len();
+        let mut boundary = read_boundary(&self.page)?;
+        if record_storage_size > boundary - BOUNDARY_BYTES {
             self.flush(self.latest_lsn)?;
-            let mut files = lock(&self.file_manager)?;
-            (self.block, self.page) = append_new_block(&mut files, self.block.filename())?;
-            position = size;
+            let mut file_manager_guard = lock(&self.file_manager)?;
+            (self.block, self.page) =
+                append_new_block(&mut file_manager_guard, self.block.filename())?;
+            boundary = block_size;
         }
-        position -= needed;
-        self.page.set_bytes(position, record)?;
-        self.page.set_int(0, position as i32)?;
+
+        let record_offset = boundary - record_storage_size;
+        self.page.set_bytes(record_offset, record)?;
+        self.page.set_int(BOUNDARY_OFFSET, record_offset as i32)?;
         self.latest_lsn = next_lsn;
         Ok(next_lsn)
     }
@@ -98,11 +102,14 @@ impl LogManager {
     }
 }
 
-fn append_new_block(files: &mut FileManager, filename: &str) -> io::Result<(BlockId, Page)> {
-    let size = files.block_size();
-    let mut page = Page::new(size);
-    page.set_int(0, size as i32)?;
-    let block = files.append(filename)?;
-    files.write(&block, &page)?;
+fn append_new_block(
+    file_manager_guard: &mut FileManager,
+    filename: &str,
+) -> io::Result<(BlockId, Page)> {
+    let block_size = file_manager_guard.block_size();
+    let mut page = Page::new(block_size);
+    page.set_int(BOUNDARY_OFFSET, block_size as i32)?;
+    let block = file_manager_guard.append(filename)?;
+    file_manager_guard.write(&block, &page)?;
     Ok((block, page))
 }

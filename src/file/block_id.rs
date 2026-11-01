@@ -18,6 +18,7 @@ impl BlockId {
     pub fn filename(&self) -> &str {
         &self.filename
     }
+
     pub fn number(&self) -> u64 {
         self.number
     }

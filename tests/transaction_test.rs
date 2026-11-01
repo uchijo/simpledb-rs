@@ -10,47 +10,56 @@ use simpledb_rs::log::LogManager;
 use simpledb_rs::tx::{LockTable, Transaction};
 use support::TestDirectory;
 
+const BLOCK_SIZE: usize = 400;
+const BUFFER_COUNT: usize = 2;
+const NUMBER_OFFSET: usize = 0;
+const TEXT_OFFSET: usize = 40;
+
 struct Database {
-    files: Arc<Mutex<FileManager>>,
-    log: Arc<Mutex<LogManager>>,
-    buffers: Arc<BufferManager>,
-    locks: Arc<LockTable>,
+    file_manager: Arc<Mutex<FileManager>>,
+    log_manager: Arc<Mutex<LogManager>>,
+    buffer_manager: Arc<BufferManager>,
+    lock_table: Arc<LockTable>,
 }
 
 impl Database {
     fn open(directory: &TestDirectory) -> io::Result<Self> {
-        let files = Arc::new(Mutex::new(FileManager::new(directory.path(), 400)?));
-        let log = Arc::new(Mutex::new(LogManager::new(
-            Arc::clone(&files),
+        let file_manager = Arc::new(Mutex::new(FileManager::new(directory.path(), BLOCK_SIZE)?));
+        let log_manager = Arc::new(Mutex::new(LogManager::new(
+            Arc::clone(&file_manager),
             "simpledb.log",
         )?));
-        let buffers = Arc::new(BufferManager::new(Arc::clone(&files), Arc::clone(&log), 2)?);
+        let buffer_manager = Arc::new(BufferManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&log_manager),
+            BUFFER_COUNT,
+        )?);
         Ok(Self {
-            files,
-            log,
-            buffers,
-            locks: Arc::new(LockTable::default()),
+            file_manager,
+            log_manager,
+            buffer_manager,
+            lock_table: Arc::new(LockTable::default()),
         })
     }
 
-    fn transaction(&self) -> io::Result<Transaction> {
+    fn begin_transaction(&self) -> io::Result<Transaction> {
         Transaction::new(
-            Arc::clone(&self.files),
-            Arc::clone(&self.log),
-            Arc::clone(&self.buffers),
-            Arc::clone(&self.locks),
+            Arc::clone(&self.file_manager),
+            Arc::clone(&self.log_manager),
+            Arc::clone(&self.buffer_manager),
+            Arc::clone(&self.lock_table),
         )
     }
 
-    fn initialize(&self) -> io::Result<BlockId> {
-        let mut tx = self.transaction()?;
-        let block = tx.append("test.tbl")?;
-        tx.pin(&block)?;
-        tx.set_int(&block, 0, 10, false)?;
+    fn create_initialized_block(&self) -> io::Result<BlockId> {
+        let mut transaction = self.begin_transaction()?;
+        let block = transaction.append("test.tbl")?;
+        transaction.pin(&block)?;
+        transaction.set_int(&block, NUMBER_OFFSET, 10, false)?;
         // Formatting must not interpret the previous bytes as a string.
-        tx.set_int(&block, 40, -1, false)?;
-        tx.set_string(&block, 40, "元の値", false)?;
-        tx.commit()?;
+        transaction.set_int(&block, TEXT_OFFSET, -1, false)?;
+        transaction.set_string(&block, TEXT_OFFSET, "元の値", false)?;
+        transaction.commit()?;
         Ok(block)
     }
 }
@@ -58,165 +67,185 @@ impl Database {
 #[test]
 fn commit_persists_and_rollback_undoes_repeated_updates() -> io::Result<()> {
     let directory = TestDirectory::new();
-    let db = Database::open(&directory)?;
-    let block = db.initialize()?;
-    let mut tx = db.transaction()?;
-    tx.pin(&block)?;
-    tx.pin(&block)?;
-    tx.unpin(&block)?;
+    let database = Database::open(&directory)?;
+    let block = database.create_initialized_block()?;
+    let mut transaction = database.begin_transaction()?;
+    transaction.pin(&block)?;
+    transaction.pin(&block)?;
+    transaction.unpin(&block)?;
 
-    tx.set_int(&block, 0, 20, true)?;
-    tx.set_int(&block, 0, 30, true)?;
-    tx.set_string(&block, 40, "変更🦀", true)?;
-    tx.rollback()?;
+    transaction.set_int(&block, NUMBER_OFFSET, 20, true)?;
+    transaction.set_int(&block, NUMBER_OFFSET, 30, true)?;
+    transaction.set_string(&block, TEXT_OFFSET, "変更🦀", true)?;
+    transaction.rollback()?;
 
-    assert_eq!(db.buffers.available()?, 2);
+    assert_eq!(database.buffer_manager.available()?, BUFFER_COUNT);
     assert_eq!(
-        tx.get_int(&block, 0).unwrap_err().kind(),
+        transaction
+            .get_int(&block, NUMBER_OFFSET)
+            .unwrap_err()
+            .kind(),
         ErrorKind::InvalidInput
     );
 
-    let mut tx = db.transaction()?;
-    tx.pin(&block)?;
-    assert_eq!(tx.get_int(&block, 0)?, 10);
-    assert_eq!(tx.get_string(&block, 40)?, "元の値");
+    let mut transaction = database.begin_transaction()?;
+    transaction.pin(&block)?;
+    assert_eq!(transaction.get_int(&block, NUMBER_OFFSET)?, 10);
+    assert_eq!(transaction.get_string(&block, TEXT_OFFSET)?, "元の値");
 
-    tx.set_int(&block, 0, 99, true)?;
-    tx.commit()?;
-    drop(db);
+    transaction.set_int(&block, NUMBER_OFFSET, 99, true)?;
+    transaction.commit()?;
+    drop(database);
 
-    let db = Database::open(&directory)?;
-    let mut tx = db.transaction()?;
-    tx.recover()?;
-    tx.pin(&block)?;
-    assert_eq!(tx.get_int(&block, 0)?, 99);
-    tx.commit()?;
+    let database = Database::open(&directory)?;
+    let mut transaction = database.begin_transaction()?;
+    transaction.recover()?;
+    transaction.pin(&block)?;
+    assert_eq!(transaction.get_int(&block, NUMBER_OFFSET)?, 99);
+    transaction.commit()?;
+
     Ok(())
 }
 
 #[test]
 fn restart_undoes_flushed_uncommitted_data_and_recovery_is_repeatable() -> io::Result<()> {
     let directory = TestDirectory::new();
-    let db = Database::open(&directory)?;
-    let block = db.initialize()?;
-    let mut tx = db.transaction()?;
-    tx.pin(&block)?;
-    tx.set_int(&block, 0, 20, true)?;
-    tx.set_string(&block, 40, "失われる更新", true)?;
-    tx.unpin(&block)?;
+    let database = Database::open(&directory)?;
+    let block = database.create_initialized_block()?;
+    let mut transaction = database.begin_transaction()?;
+    transaction.pin(&block)?;
+    transaction.set_int(&block, NUMBER_OFFSET, 20, true)?;
+    transaction.set_string(&block, TEXT_OFFSET, "失われる更新", true)?;
+    transaction.unpin(&block)?;
 
     // Force eviction so uncommitted data, and its undo log, reach disk.
-    let other = tx.append("test.tbl")?;
-    tx.pin(&other)?;
-    drop(tx);
-    drop(db);
+    let other = transaction.append("test.tbl")?;
+    transaction.pin(&other)?;
+    drop(transaction);
+    drop(database);
 
     for _ in 0..2 {
-        let db = Database::open(&directory)?;
-        let mut tx = db.transaction()?;
-        tx.recover()?;
-        tx.pin(&block)?;
+        let database = Database::open(&directory)?;
+        let mut transaction = database.begin_transaction()?;
+        transaction.recover()?;
+        transaction.pin(&block)?;
 
-        assert_eq!(tx.get_int(&block, 0)?, 10);
-        assert_eq!(tx.get_string(&block, 40)?, "元の値");
+        assert_eq!(transaction.get_int(&block, NUMBER_OFFSET)?, 10);
+        assert_eq!(transaction.get_string(&block, TEXT_OFFSET)?, "元の値");
 
-        tx.commit()?;
+        transaction.commit()?;
     }
+
     Ok(())
 }
 
 #[test]
 fn writer_waits_for_reader_and_proceeds_after_commit() -> io::Result<()> {
     let directory = TestDirectory::new();
-    let db = Database::open(&directory)?;
-    let block = db.initialize()?;
-    let mut reader = db.transaction()?;
+    let database = Database::open(&directory)?;
+    let block = database.create_initialized_block()?;
+    let mut reader = database.begin_transaction()?;
     reader.pin(&block)?;
-    assert_eq!(reader.get_int(&block, 0)?, 10);
+    assert_eq!(reader.get_int(&block, NUMBER_OFFSET)?, 10);
 
     std::thread::scope(|scope| -> io::Result<()> {
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let mut writer = db.transaction()?;
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let mut writer = database.begin_transaction()?;
         writer.pin(&block)?;
         scope.spawn(move || {
-            started_tx.send(()).unwrap();
+            started_sender.send(()).unwrap();
             let result = writer
-                .set_int(&block, 0, 20, true)
+                .set_int(&block, NUMBER_OFFSET, 20, true)
                 .and_then(|_| writer.commit());
-            done_tx.send(result).unwrap();
+            finished_sender.send(result).unwrap();
         });
 
-        started_rx.recv().unwrap();
+        started_receiver.recv().unwrap();
         assert!(matches!(
-            done_rx.recv_timeout(Duration::from_millis(50)),
+            finished_receiver.recv_timeout(Duration::from_millis(50)),
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
 
         reader.commit()?;
-        done_rx.recv_timeout(Duration::from_secs(2)).unwrap()?;
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()?;
+
         Ok(())
     })?;
+
     Ok(())
 }
 
 #[test]
 fn lock_upgrade_times_out_and_rollback_releases_the_read_lock() -> io::Result<()> {
     let directory = TestDirectory::new();
-    let db = Database::open(&directory)?;
-    let block = db.initialize()?;
-    let mut first = db.transaction()?;
-    let mut second = db.transaction()?;
+    let database = Database::open(&directory)?;
+    let block = database.create_initialized_block()?;
+    let mut first = database.begin_transaction()?;
+    let mut second = database.begin_transaction()?;
     first.pin(&block)?;
     second.pin(&block)?;
 
-    assert_eq!(first.get_int(&block, 0)?, 10);
-    assert_eq!(second.get_int(&block, 0)?, 10);
+    assert_eq!(first.get_int(&block, NUMBER_OFFSET)?, 10);
+    assert_eq!(second.get_int(&block, NUMBER_OFFSET)?, 10);
 
     assert_eq!(
-        first.set_int(&block, 0, 20, true).unwrap_err().kind(),
+        first
+            .set_int(&block, NUMBER_OFFSET, 20, true)
+            .unwrap_err()
+            .kind(),
         ErrorKind::TimedOut
     );
     first.rollback()?;
 
-    second.set_int(&block, 0, 30, true)?;
+    second.set_int(&block, NUMBER_OFFSET, 30, true)?;
     second.commit()?;
 
-    assert_eq!(db.buffers.available()?, 2);
+    assert_eq!(database.buffer_manager.available()?, BUFFER_COUNT);
+
     Ok(())
 }
 
 #[test]
 fn file_size_read_prevents_append_until_transaction_finishes() -> io::Result<()> {
     let directory = TestDirectory::new();
-    let db = Database::open(&directory)?;
-    db.initialize()?;
-    let mut reader = db.transaction()?;
+    let database = Database::open(&directory)?;
+    database.create_initialized_block()?;
+    let mut reader = database.begin_transaction()?;
     assert_eq!(reader.size("test.tbl")?, 1);
 
     std::thread::scope(|scope| -> io::Result<()> {
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let mut writer = db.transaction()?;
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let mut writer = database.begin_transaction()?;
         scope.spawn(move || {
-            started_tx.send(()).unwrap();
+            started_sender.send(()).unwrap();
             let result = writer.append("test.tbl").and_then(|block| {
                 writer.commit()?;
                 Ok(block.number())
             });
-            done_tx.send(result).unwrap();
+            finished_sender.send(result).unwrap();
         });
 
-        started_rx.recv().unwrap();
+        started_receiver.recv().unwrap();
         assert!(matches!(
-            done_rx.recv_timeout(Duration::from_millis(50)),
+            finished_receiver.recv_timeout(Duration::from_millis(50)),
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
         assert_eq!(reader.size("test.tbl")?, 1);
 
         reader.commit()?;
-        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap()?, 1);
+        assert_eq!(
+            finished_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()?,
+            1
+        );
+
         Ok(())
     })?;
+
     Ok(())
 }

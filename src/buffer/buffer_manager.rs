@@ -8,7 +8,9 @@ use crate::sync::lock;
 
 use super::{Buffer, PinnedBuffer};
 
-/// Fixed-size pool with first-unpinned replacement and a ten-second pin timeout.
+const PIN_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fixed-size pool with first-unpinned replacement and a 10-second pin timeout.
 /// Share through `Arc` so transactions can own their pins independently.
 /// Lock order is buffer pool, log manager, then file manager.
 pub struct BufferManager {
@@ -31,8 +33,8 @@ impl BufferManager {
                 "buffer pool must not be empty",
             ));
         }
-        let size = lock(&file_manager)?.block_size();
-        let pool = (0..buffer_count).map(|_| Buffer::new(size)).collect();
+        let block_size = lock(&file_manager)?.block_size();
+        let pool = (0..buffer_count).map(|_| Buffer::new(block_size)).collect();
         Ok(Self {
             file_manager,
             log_manager,
@@ -46,11 +48,11 @@ impl BufferManager {
         Ok(pool.iter().filter(|buffer| !buffer.is_pinned()).count())
     }
 
-    pub fn flush_all(&self, transaction: u64) -> io::Result<()> {
+    pub fn flush_all(&self, transaction_id: u64) -> io::Result<()> {
         let mut pool = lock(&self.pool)?;
         for buffer in pool
             .iter_mut()
-            .filter(|buffer| buffer.modifying_tx() == Some(transaction))
+            .filter(|buffer| buffer.modifying_tx() == Some(transaction_id))
         {
             buffer.flush(&self.file_manager, &self.log_manager)?;
         }
@@ -58,31 +60,31 @@ impl BufferManager {
     }
 
     pub fn pin(self: &Arc<Self>, block: &BlockId) -> io::Result<PinnedBuffer> {
-        let start = Instant::now();
+        let wait_started = Instant::now();
         let mut pool = lock(&self.pool)?;
         loop {
-            let index = pool
+            let buffer_index = pool
                 .iter()
                 .position(|buffer| buffer.block() == Some(block))
                 .or_else(|| pool.iter().position(|buffer| !buffer.is_pinned()));
-            if let Some(index) = index {
-                let buffer = &mut pool[index];
+            if let Some(buffer_index) = buffer_index {
+                let buffer = &mut pool[buffer_index];
                 if buffer.block() != Some(block) {
                     buffer.assign_to_block(block, &self.file_manager, &self.log_manager)?;
                 }
-                buffer.pins += 1;
+                buffer.pin_count += 1;
                 return Ok(PinnedBuffer {
                     manager: Arc::clone(self),
-                    index,
+                    buffer_index,
                 });
             }
-            let remaining = Duration::from_secs(10).saturating_sub(start.elapsed());
-            if remaining.is_zero() {
+            let remaining_wait = PIN_WAIT_TIMEOUT.saturating_sub(wait_started.elapsed());
+            if remaining_wait.is_zero() {
                 return Err(Error::new(ErrorKind::TimedOut, "no available buffer"));
             }
             (pool, _) = self
                 .released
-                .wait_timeout(pool, remaining)
+                .wait_timeout(pool, remaining_wait)
                 .map_err(|_| Error::other("buffer pool poisoned"))?;
         }
     }

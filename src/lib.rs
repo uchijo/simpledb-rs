@@ -18,23 +18,24 @@
 //! use simpledb_rs::buffer::BufferManager;
 //!
 //! # fn main() -> io::Result<()> {
-//! let fm = Arc::new(Mutex::new(FileManager::new("example-db", 400)?));
-//! let lm = Arc::new(Mutex::new(LogManager::new(Arc::clone(&fm), "simpledb.log")?));
-//! let buffers = Arc::new(BufferManager::new(Arc::clone(&fm), Arc::clone(&lm), 3)?);
-//! let block = fm.lock().unwrap().append("test.tbl")?;
+//! let file_manager = Arc::new(Mutex::new(FileManager::new("example-db", 400)?));
+//! let log_manager = Arc::new(Mutex::new(LogManager::new(Arc::clone(&file_manager), "simpledb.log")?));
+//! let buffers = Arc::new(BufferManager::new(Arc::clone(&file_manager), Arc::clone(&log_manager), 3)?);
+//! let block = file_manager.lock().unwrap().append("test.tbl")?;
 //!
 //! let pin = buffers.pin(&block)?;
 //! {
 //!     let mut buffer = pin.lock()?;
-//!     let mut record = Page::new(4);
+//!     let mut record = Page::new(size_of::<i32>());
 //!     record.set_int(0, buffer.contents().get_int(80)?)?;
-//!     let lsn = lm.lock().unwrap().append(&record.into_bytes())?;
+//!     let lsn = log_manager.lock().unwrap().append(&record.into_bytes())?;
 //!     buffer.contents_mut().set_int(80, 345)?;
 //!     buffer.set_modified(1, Some(lsn));
 //! }
 //! drop(pin); // unpin without writing the dirty page yet
 //! buffers.flush_all(1)?; // force the log first, then the data page
-//! for record in lm.lock().unwrap().iterator()? {
+//! let records = log_manager.lock().unwrap().iterator()?;
+//! for record in records {
 //!     println!("{}", Page::from_bytes(record?).get_int(0)?);
 //! }
 //! # Ok(())

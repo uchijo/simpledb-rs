@@ -1,6 +1,8 @@
 use std::io::{self, Error, ErrorKind};
 use std::ops::Range;
 
+const MAX_UTF8_BYTES_PER_CHAR: usize = 4;
+
 /// In-memory bytes of a block or log record.
 /// Integers and byte lengths are signed 32-bit little-endian values.
 #[derive(Clone, Debug)]
@@ -11,8 +13,8 @@ pub struct Page {
 impl Page {
     const INT_BYTES: usize = size_of::<i32>();
 
-    pub fn new(size: usize) -> Self {
-        Self::from_bytes(vec![0; size])
+    pub fn new(page_size: usize) -> Self {
+        Self::from_bytes(vec![0; page_size])
     }
 
     pub fn from_bytes(contents: Vec<u8>) -> Self {
@@ -24,7 +26,7 @@ impl Page {
         self.contents
     }
 
-    fn range(&self, offset: usize, length: usize) -> io::Result<Range<usize>> {
+    pub(crate) fn checked_range(&self, offset: usize, length: usize) -> io::Result<Range<usize>> {
         let end = offset
             .checked_add(length)
             .filter(|&end| end <= self.contents.len())
@@ -33,35 +35,35 @@ impl Page {
     }
 
     pub fn get_int(&self, offset: usize) -> io::Result<i32> {
-        let range = self.range(offset, Self::INT_BYTES)?;
+        let range = self.checked_range(offset, Self::INT_BYTES)?;
         let mut bytes = [0; Self::INT_BYTES];
         bytes.copy_from_slice(&self.contents[range]);
         Ok(i32::from_le_bytes(bytes))
     }
 
     pub fn set_int(&mut self, offset: usize, value: i32) -> io::Result<()> {
-        let range = self.range(offset, Self::INT_BYTES)?;
+        let range = self.checked_range(offset, Self::INT_BYTES)?;
         self.contents[range].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
     pub fn get_bytes(&self, offset: usize) -> io::Result<&[u8]> {
-        let length = usize::try_from(self.get_int(offset)?)
+        let payload_length = usize::try_from(self.get_int(offset)?)
             .map_err(|_| Error::new(ErrorKind::InvalidData, "negative byte length"))?;
         // get_int already checked that the length prefix fits.
-        let range = self
-            .range(offset + Self::INT_BYTES, length)
+        let payload_range = self
+            .checked_range(offset + Self::INT_BYTES, payload_length)
             .map_err(|_| Error::new(ErrorKind::InvalidData, "byte length exceeds page bounds"))?;
-        Ok(&self.contents[range])
+        Ok(&self.contents[payload_range])
     }
 
     pub fn set_bytes(&mut self, offset: usize, value: &[u8]) -> io::Result<()> {
-        let length = i32::try_from(value.len())
+        let stored_length = i32::try_from(value.len())
             .map_err(|_| Error::new(ErrorKind::InvalidInput, "byte length exceeds i32"))?;
-        self.range(offset, Self::INT_BYTES + value.len())?;
-        self.set_int(offset, length)?;
-        let start = offset + Self::INT_BYTES;
-        self.contents[start..start + value.len()].copy_from_slice(value);
+        self.checked_range(offset, Self::INT_BYTES + value.len())?;
+        self.set_int(offset, stored_length)?;
+        let payload_start = offset + Self::INT_BYTES;
+        self.contents[payload_start..payload_start + value.len()].copy_from_slice(value);
         Ok(())
     }
 
@@ -76,10 +78,10 @@ impl Page {
 
     /// Maximum storage size for this many Unicode scalar values in UTF-8.
     pub fn max_length(char_count: usize) -> io::Result<usize> {
-        let bytes = char_count
-            .checked_mul(4)
+        let max_text_bytes = char_count
+            .checked_mul(MAX_UTF8_BYTES_PER_CHAR)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "string size overflow"))?;
-        bytes
+        max_text_bytes
             .checked_add(Self::INT_BYTES)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "string size overflow"))
     }
@@ -87,6 +89,7 @@ impl Page {
     pub(crate) fn contents(&self) -> &[u8] {
         &self.contents
     }
+
     pub(crate) fn contents_mut(&mut self) -> &mut [u8] {
         &mut self.contents
     }

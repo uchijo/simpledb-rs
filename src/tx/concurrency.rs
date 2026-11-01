@@ -6,18 +6,22 @@ use std::time::{Duration, Instant};
 use crate::file::BlockId;
 use crate::sync::lock;
 
-// None denotes the file's end marker, which is block -1 in the book.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) struct Resource(pub String, pub Option<u64>);
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-impl From<&BlockId> for Resource {
-    fn from(block: &BlockId) -> Self {
-        Self(block.filename().to_owned(), Some(block.number()))
-    }
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) enum LockTarget {
+    Block(BlockId),
+    // The book uses a dummy block numbered -1 for the file's end marker.
+    FileEnd(String),
+}
+
+pub(super) enum LockMode {
+    Shared,
+    Exclusive,
 }
 
 #[derive(Default)]
-struct Holders {
+struct LockHolders {
     readers: HashSet<u64>,
     writer: Option<u64>,
 }
@@ -25,29 +29,41 @@ struct Holders {
 /// One shared lock table per database. Locks are held until commit or rollback.
 #[derive(Default)]
 pub struct LockTable {
-    locks: Mutex<HashMap<Resource, Holders>>,
+    locks: Mutex<HashMap<LockTarget, LockHolders>>,
     released: Condvar,
 }
 
 impl LockTable {
-    pub(super) fn acquire(&self, resource: Resource, tx: u64, exclusive: bool) -> io::Result<()> {
-        let start = Instant::now();
+    pub(super) fn acquire(
+        &self,
+        target: LockTarget,
+        transaction_id: u64,
+        mode: LockMode,
+    ) -> io::Result<()> {
+        let wait_started = Instant::now();
         let mut locks = lock(&self.locks)?;
         loop {
-            let holders = locks.entry(resource.clone()).or_default();
-            let writer_conflicts = holders.writer.is_some_and(|writer| writer != tx);
-            let readers_conflict = exclusive && holders.readers.iter().any(|&reader| reader != tx);
+            let holders = locks.entry(target.clone()).or_default();
+            let writer_conflicts = holders
+                .writer
+                .is_some_and(|writer| writer != transaction_id);
+            let readers_conflict = matches!(mode, LockMode::Exclusive)
+                && holders
+                    .readers
+                    .iter()
+                    .any(|&reader| reader != transaction_id);
             if !writer_conflicts && !readers_conflict {
-                if exclusive {
-                    holders.writer = Some(tx);
-                } else {
-                    holders.readers.insert(tx);
+                match mode {
+                    LockMode::Exclusive => holders.writer = Some(transaction_id),
+                    LockMode::Shared => {
+                        holders.readers.insert(transaction_id);
+                    }
                 }
                 return Ok(());
             }
 
-            let remaining = Duration::from_secs(10).saturating_sub(start.elapsed());
-            if remaining.is_zero() {
+            let remaining_wait = LOCK_WAIT_TIMEOUT.saturating_sub(wait_started.elapsed());
+            if remaining_wait.is_zero() {
                 return Err(Error::new(
                     ErrorKind::TimedOut,
                     "transaction lock timeout; rollback required",
@@ -55,15 +71,15 @@ impl LockTable {
             }
             (locks, _) = self
                 .released
-                .wait_timeout(locks, remaining)
+                .wait_timeout(locks, remaining_wait)
                 .map_err(|_| Error::other("lock table poisoned"))?;
         }
     }
 
-    pub(super) fn release(&self, tx: u64) -> io::Result<()> {
+    pub(super) fn release(&self, transaction_id: u64) -> io::Result<()> {
         lock(&self.locks)?.retain(|_, holders| {
-            holders.readers.remove(&tx);
-            if holders.writer == Some(tx) {
+            holders.readers.remove(&transaction_id);
+            if holders.writer == Some(transaction_id) {
                 holders.writer = None;
             }
             holders.writer.is_some() || !holders.readers.is_empty()

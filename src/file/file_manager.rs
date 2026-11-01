@@ -51,13 +51,53 @@ impl FileManager {
     pub fn is_new(&self) -> bool {
         self.is_new
     }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
 
-    fn get_file(&mut self, filename: &str) -> io::Result<&mut File> {
+    /// Read a complete block. A missing file is created, then reading returns EOF.
+    pub fn read(&mut self, block: &BlockId, page: &mut Page) -> io::Result<()> {
+        self.check_page(page)?;
+        let byte_offset = self.block_offset(block)?;
+        let file = self.open_file(block.filename())?;
+        file.seek(SeekFrom::Start(byte_offset))?;
+        file.read_exact(page.contents_mut())
+    }
+
+    pub fn write(&mut self, block: &BlockId, page: &Page) -> io::Result<()> {
+        self.check_page(page)?;
+        let byte_offset = self.block_offset(block)?;
+        let file = self.open_file(block.filename())?;
+        file.seek(SeekFrom::Start(byte_offset))?;
+        file.write_all(page.contents())?;
+        file.sync_all()
+    }
+
+    /// Return the block count, creating an empty file if it does not exist.
+    pub fn length(&mut self, filename: &str) -> io::Result<u64> {
+        let block_size = self.block_size as u64;
+        let file_size_bytes = self.open_file(filename)?.metadata()?.len();
+        if file_size_bytes % block_size != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "file contains a partial block",
+            ));
+        }
+        Ok(file_size_bytes / block_size)
+    }
+
+    pub fn append(&mut self, filename: &str) -> io::Result<BlockId> {
+        let block = BlockId::new(filename, self.length(filename)?);
+        self.write(&block, &Page::new(self.block_size))?;
+        Ok(block)
+    }
+
+    fn open_file(&mut self, filename: &str) -> io::Result<&mut File> {
         let mut components = Path::new(filename).components();
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        let is_single_filename =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if !is_single_filename {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "expected a database file name",
@@ -78,7 +118,7 @@ impl FileManager {
             .expect("file was inserted"))
     }
 
-    fn offset(&self, block: &BlockId) -> io::Result<u64> {
+    fn block_offset(&self, block: &BlockId) -> io::Result<u64> {
         block
             .number()
             .checked_mul(self.block_size as u64)
@@ -93,40 +133,5 @@ impl FileManager {
             ));
         }
         Ok(())
-    }
-
-    pub fn read(&mut self, block: &BlockId, page: &mut Page) -> io::Result<()> {
-        self.check_page(page)?;
-        let offset = self.offset(block)?;
-        let file = self.get_file(block.filename())?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(page.contents_mut())
-    }
-
-    pub fn write(&mut self, block: &BlockId, page: &Page) -> io::Result<()> {
-        self.check_page(page)?;
-        let offset = self.offset(block)?;
-        let file = self.get_file(block.filename())?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(page.contents())?;
-        file.sync_all()
-    }
-
-    pub fn length(&mut self, filename: &str) -> io::Result<u64> {
-        let block_size = self.block_size as u64;
-        let size = self.get_file(filename)?.metadata()?.len();
-        if size % block_size != 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "file contains a partial block",
-            ));
-        }
-        Ok(size / block_size)
-    }
-
-    pub fn append(&mut self, filename: &str) -> io::Result<BlockId> {
-        let block = BlockId::new(filename, self.length(filename)?);
-        self.write(&block, &Page::new(self.block_size))?;
-        Ok(block)
     }
 }
