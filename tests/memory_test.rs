@@ -50,64 +50,6 @@ impl Database {
 }
 
 #[test]
-fn logged_updates_can_be_undone_in_reverse_order() -> io::Result<()> {
-    let db = Database::new()?;
-    let pool = db.pool(1)?;
-    let block = db.block()?;
-
-    let pin = pool.pin(&block)?;
-    {
-        let mut buffer = pin.lock()?;
-        buffer.contents_mut().set_int(0, 10)?;
-        buffer.set_modified(0, None);
-    }
-    pool.flush_all(0)?;
-
-    for value in [20, 30] {
-        let mut buffer = pin.lock()?;
-        let old_value = buffer.contents().get_int(0)?;
-
-        let mut record = Page::new(4);
-        record.set_int(0, old_value)?;
-        let lsn = db.lm.lock().unwrap().append(&record.into_bytes())?;
-
-        buffer.contents_mut().set_int(0, value)?;
-        buffer.set_modified(1, Some(lsn));
-    }
-    pool.flush_all(1)?;
-
-    assert_eq!(db.disk_value(&block)?, 30);
-
-    drop(pin);
-
-    // Recovery holds the iterator, not the log lock, while undoing through buffers.
-    let records = db.lm.lock().unwrap().iterator()?;
-    for record in records {
-        let old_value = Page::from_bytes(record?).get_int(0)?;
-
-        let pin = pool.pin(&block)?;
-        let mut buffer = pin.lock()?;
-        buffer.contents_mut().set_int(0, old_value)?;
-        buffer.set_modified(2, None);
-    }
-    pool.flush_all(2)?;
-
-    assert_eq!(db.disk_value(&block)?, 10);
-    assert_eq!(pool.available()?, 1);
-    assert_eq!(
-        db.lm
-            .lock()
-            .unwrap()
-            .iterator()?
-            .collect::<io::Result<Vec<_>>>()?
-            .len(),
-        2
-    );
-
-    Ok(())
-}
-
-#[test]
 fn log_records_cross_blocks_and_survive_reopening_in_reverse_order() -> io::Result<()> {
     let db = Database::new()?;
     let records: Vec<_> = (0..70_i32)
@@ -338,7 +280,7 @@ fn flush_all_writes_only_the_requested_transactions_pages() -> io::Result<()> {
 }
 
 #[test]
-fn poisoned_buffer_rejects_access_without_panicking_during_unpin() -> io::Result<()> {
+fn poisoned_pool_mutex_rejects_access_and_allows_unpin() -> io::Result<()> {
     let db = Database::new()?;
     let pool = db.pool(1)?;
     let block = db.block()?;

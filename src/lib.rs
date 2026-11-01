@@ -1,4 +1,4 @@
-//! SimpleDB chapters 3–4: block files, a reverse log, and a fixed buffer pool.
+//! SimpleDB chapters 3–5: files, logs, buffers, and transactions.
 //!
 //! Use one file manager, log manager, and buffer manager per database. Pins are
 //! released on drop; dirty pages are written on replacement or `flush_all`.
@@ -45,3 +45,4 @@ pub mod buffer;
 pub mod file;
 pub mod log;
 mod sync;
+pub mod tx;
