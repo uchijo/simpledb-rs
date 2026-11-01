@@ -21,7 +21,9 @@ fn written_values_can_be_read_after_reopening_database() -> io::Result<()> {
 
     let mut writer = FileManager::new(&database_path, BLOCK_SIZE)?;
     writer.write(&block, &written_page)?;
+
     assert_eq!(writer.length("students.tbl")?, 3);
+
     drop(writer);
 
     let mut reader = FileManager::new(&database_path, BLOCK_SIZE)?;
@@ -30,6 +32,7 @@ fn written_values_can_be_read_after_reopening_database() -> io::Result<()> {
 
     assert_eq!(loaded_page.get_string(text_offset)?, text);
     assert_eq!(loaded_page.get_int(number_offset)?, 345);
+
     Ok(())
 }
 
@@ -39,23 +42,15 @@ fn new_database_is_reported_only_on_first_open() -> io::Result<()> {
     let database_path = directory.path().join("db");
 
     let first_open = FileManager::new(&database_path, BLOCK_SIZE)?;
+
     assert!(first_open.is_new());
+
     drop(first_open);
 
     let second_open = FileManager::new(&database_path, BLOCK_SIZE)?;
+
     assert!(!second_open.is_new());
-    Ok(())
-}
 
-#[test]
-fn appended_block_is_zero_filled() -> io::Result<()> {
-    let directory = TestDirectory::new();
-    let mut file_manager = FileManager::new(directory.path(), BLOCK_SIZE)?;
-
-    let block = file_manager.append("students.tbl")?;
-
-    let stored_bytes = fs::read(directory.path().join(block.filename()))?;
-    assert_eq!(stored_bytes, vec![0; BLOCK_SIZE]);
     Ok(())
 }
 
@@ -75,12 +70,14 @@ fn append_does_not_overwrite_blocks_after_reading_from_start() -> io::Result<()>
 
     let expected_bytes = [original_bytes, vec![0; BLOCK_SIZE]].concat();
     assert_eq!(fs::read(&file_path)?, expected_bytes);
+
     Ok(())
 }
 
 #[test]
 fn zero_block_size_is_rejected() {
     let directory = TestDirectory::new();
+
     assert!(FileManager::new(directory.path(), 0).is_err());
 }
 
@@ -94,6 +91,7 @@ fn reading_missing_block_returns_unexpected_eof() -> io::Result<()> {
     let error = file_manager.read(&block, &mut page).unwrap_err();
 
     assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+
     Ok(())
 }
 
@@ -112,6 +110,7 @@ fn page_size_must_match_block_size() -> io::Result<()> {
 
     assert_eq!(write_error.kind(), ErrorKind::InvalidInput);
     assert_eq!(read_error.kind(), ErrorKind::InvalidInput);
+
     Ok(())
 }
 
@@ -126,6 +125,7 @@ fn overflowing_block_offset_is_rejected() -> io::Result<()> {
         .unwrap_err();
 
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
     Ok(())
 }
 
@@ -136,8 +136,10 @@ fn filename_must_be_a_single_name() -> io::Result<()> {
 
     for name in ["", "../outside", "/absolute", "nested/file"] {
         let error = file_manager.append(name).unwrap_err();
+
         assert_eq!(error.kind(), ErrorKind::InvalidInput, "filename: {name:?}");
     }
+
     Ok(())
 }
 
@@ -153,6 +155,7 @@ fn partial_block_is_rejected() -> io::Result<()> {
 
     assert_eq!(length_error.kind(), ErrorKind::InvalidData);
     assert_eq!(append_error.kind(), ErrorKind::InvalidData);
+
     Ok(())
 }
 
@@ -168,5 +171,6 @@ fn startup_removes_only_temporary_files() -> io::Result<()> {
     assert!(!directory.path().join("temp_old").exists());
     assert!(directory.path().join("students.tbl").exists());
     assert!(directory.path().join("temp_directory").is_dir());
+
     Ok(())
 }

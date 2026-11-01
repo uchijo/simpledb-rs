@@ -19,6 +19,11 @@ impl Page {
         Self { contents }
     }
 
+    /// Recover the backing bytes after building a log record.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.contents
+    }
+
     fn range(&self, offset: usize, length: usize) -> io::Result<Range<usize>> {
         let end = offset
             .checked_add(length)
@@ -103,6 +108,7 @@ mod tests {
         assert_eq!(page.get_string(0)?, text);
         // The length prefix stores the UTF-8 byte count, not the character count.
         assert_eq!(page.get_int(0)?, text.len() as i32);
+
         Ok(())
     }
 
@@ -114,6 +120,7 @@ mod tests {
         page.set_bytes(0, &bytes)?;
 
         assert_eq!(page.get_bytes(0)?, &bytes);
+
         Ok(())
     }
 
@@ -125,6 +132,7 @@ mod tests {
         let error = page.get_string(0).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+
         Ok(())
     }
 
@@ -133,11 +141,14 @@ mod tests {
         // -345 is 0xfffffea7, stored least significant byte first.
         let stored_bytes = vec![0xa7, 0xfe, 0xff, 0xff];
         let stored_page = Page::from_bytes(stored_bytes.clone());
+
         assert_eq!(stored_page.get_int(0)?, -345);
 
         let mut written_page = Page::new(Page::INT_BYTES);
         written_page.set_int(0, -345)?;
+
         assert_eq!(written_page.contents(), stored_bytes);
+
         Ok(())
     }
 
@@ -151,6 +162,7 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert_eq!(page.get_bytes(0)?, &[]);
+
         Ok(())
     }
 
@@ -170,6 +182,7 @@ mod tests {
         let error = page.get_bytes(0).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+
         Ok(())
     }
 
@@ -182,6 +195,7 @@ mod tests {
         let error = page.get_bytes(0).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+
         Ok(())
     }
 
